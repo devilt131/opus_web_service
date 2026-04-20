@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.pyc
+venv/
+*.db
+
+# Node
+node_modules/
+dist/
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+
+# Environment
+.env
+*.log
+.venv/
+frontend-vue/node_modules/
+frontend-vue/.vite/
