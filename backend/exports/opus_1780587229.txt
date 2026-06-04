@@ -1,0 +1,36 @@
+OPUS REPORT
+================================
+
+TITLE: Иван Петров
+
+SUMMARY:
+Иван Петров разработал систему анализа документов в компании Яндекс. Текст описывает процесс обработки данных и резюмирования. Иван Петров создал систему поиска данных в компании Google.
+
+COMPRESSION: -56.2%
+
+PLAN:
+Иван Петров разработал систему анализа документов в компании Яндекс. Текст описывает процесс обработки данных и резюмирования.
+
+KEYWORDS:
+иван (1), петров (1), разработать (1), система (1), анализ (1)
+
+STATS:
+Chars: 126
+Words: 18
+Sentences: 2
+Unique words: 17
+Average word length: 6.17
+Average sentence length: 9.0
+
+ENTITIES:
+Persons: Иван Петров
+Organizations: Яндекс
+Locations: none
+Dates: none
+
+PLAGIARISM:
+Uniqueness: n/a%
+Similarity: n/a
+Common words: none
+
+Report generated: 2026-06-04 20:33:49

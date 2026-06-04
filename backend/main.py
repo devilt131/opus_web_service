@@ -1,37 +1,61 @@
-from fastapi import FastAPI, HTTPException, Depends, status
+from fastapi import FastAPI, HTTPException, status, UploadFile, File, Form, Depends
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
-from jose import JWTError, jwt
+from typing import Optional, List
 import logging
 import json
 import time
+import os
 from datetime import datetime
 
 from database import engine, get_db
-from models import Base, User
-from schemas import UserRegister, UserLogin, TokenResponse, UserResponse
-from auth import create_user, authenticate_user, create_access_token, get_user_by_username
+from models import Base, User, Analysis
+from schemas import UserRegister, UserLogin, TokenResponse, UserResponse, HistoryItem, ExportRequest
+from export_utils import build_pdf_report
+from auth import (
+    create_user,
+    authenticate_user,
+    create_access_token,
+    get_user_by_username,
+    get_user_by_email,
+    get_current_user,
+    get_optional_user,
+)
 from rezumator import Rezumator
 
+# Optional imports with fallbacks
+try:
+    import PyPDF2
+    PDF_SUPPORT = True
+except ImportError:
+    PyPDF2 = None
+    PDF_SUPPORT = False
+    print("Warning: PyPDF2 not installed. PDF support disabled.")
+
+try:
+    from docx import Document
+    DOCX_SUPPORT = True
+except ImportError:
+    Document = None
+    DOCX_SUPPORT = False
+    print("Warning: python-docx not installed. DOCX support disabled.")
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+EXPORT_DIR = os.path.join(os.path.dirname(__file__), "exports")
+os.makedirs(EXPORT_DIR, exist_ok=True)
 
+# Create database tables
 Base.metadata.create_all(bind=engine)
 
-
+# Initialize Rezumator
 rez = Rezumator()
-app = FastAPI(
-    title="Opus API",
-    description="Интеллектуальный анализ текста",
-    version="1.0.0"
-)
+app = FastAPI(title="Opus API", version="1.0.0")
 
-
+# CORS middleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -41,194 +65,257 @@ app.add_middleware(
 )
 
 
-security = HTTPBearer()
-
-SECRET_KEY = "opus-secret-key-2026-change-in-production"
-ALGORITHM = "HS256"
-
-
 class AnalyzeRequest(BaseModel):
-    text: str = Field(..., min_length=10, max_length=10000, description="Текст для анализа")
-    max_length: int = Field(50, ge=10, le=200, description="Максимальная длина суммаризации")
-    min_length: int = Field(30, ge=5, le=100, description="Минимальная длина суммаризации")
+    text: str = Field(..., min_length=10, max_length=10000)
+    ref_text: Optional[str] = Field(None, description="reference text for plagiarism")
 
 
 class AnalyzeResponse(BaseModel):
-    statistics: dict
+    stats: dict
     summary: str
-    sentiment: dict
     keywords: list
     title: str
+    plan: str
     compression: float
+    entities: dict
+    plagiarism: dict = Field(default_factory=dict)
+
+
+def _save_analysis(db: Session, user: User, text: str, result: dict) -> None:
+    record = Analysis(
+        user_id=user.id,
+        text_preview=text[:200],
+        summary=result.get("summary", ""),
+        title=result.get("title", ""),
+    )
+    db.add(record)
+    db.commit()
+
+
+def _history_items(db: Session, user_id: int) -> List[HistoryItem]:
+    rows = (
+        db.query(Analysis)
+        .filter(Analysis.user_id == user_id)
+        .order_by(Analysis.created_at.desc())
+        .limit(50)
+        .all()
+    )
+    return [
+        HistoryItem(
+            id=row.id,
+            title=row.title or "Untitled",
+            preview=row.text_preview or "",
+            summary=row.summary or "",
+            date=row.created_at.isoformat() if row.created_at else "",
+        )
+        for row in rows
+    ]
 
 
 @app.get('/')
 async def root():
-    return {
-        'service': 'Opus API',
-        'version': '1.0.0',
-        'status': 'running',
-        'docs': '/docs'
-    }
+    return {'service': 'Opus API', 'status': 'running', 'docs': '/docs'}
 
 
 @app.get('/health')
 async def health():
     return {
-        'status': 'healthy',
-        't5_loaded': rez.t5_model is not None,
-        'morph_loaded': rez.morph is not None
+        'status': 'ok',
+        'model': rez.model is not None,
+        'morph': rez.morph is not None,
+        'ner': rez.ner_ok
     }
 
 
 @app.post('/analyze', response_model=AnalyzeResponse)
-async def analyze(request: AnalyzeRequest):
+async def analyze(
+    req: AnalyzeRequest,
+    db: Session = Depends(get_db),
+    user: Optional[User] = Depends(get_optional_user),
+):
     try:
-        text = request.text.strip()
+        text = req.text.strip()
         if not text:
-            raise HTTPException(status_code=400, detail="Текст не может быть пустым")
-        
-        words_count = len(text.split())
-        if words_count < 5:
-            raise HTTPException(
-                status_code=400, 
-                detail=f"Слишком мало слов: {words_count}. Минимум 5 слов"
-            )
-        
-        result = rez.full_analysis(text)
-        
+            raise HTTPException(status_code=400, detail="empty text")
+
+        words = len(text.split())
+        if words < 5:
+            raise HTTPException(status_code=400, detail=f"too few words: {words}")
+
+        result = rez.full(text, req.ref_text)
+
         if 'error' in result:
             raise HTTPException(status_code=400, detail=result['error'])
-        
-        logger.info(f"Анализ выполнен: {words_count} слов")
+
+        if user:
+            _save_analysis(db, user, text, result)
+
+        logger.info(f"analyzed: {words} words")
         return result
-        
+
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Ошибка анализа: {e}")
-        raise HTTPException(status_code=500, detail="Внутренняя ошибка сервера")
+        logger.error(f"error: {e}")
+        raise HTTPException(status_code=500, detail="server error")
+
+
+@app.post('/upload')
+async def upload_file(
+    file: UploadFile = File(...),
+    ref_text: Optional[str] = Form(None),
+    db: Session = Depends(get_db),
+    user: Optional[User] = Depends(get_optional_user),
+):
+    filename = (file.filename or "").lower()
+    text = ''
+
+    if filename.endswith('.txt'):
+        cont = await file.read()
+        text = cont.decode('utf-8')
+
+    elif filename.endswith('.pdf'):
+        if not PDF_SUPPORT:
+            raise HTTPException(status_code=400, detail="PDF support not available. Install PyPDF2.")
+        try:
+            reader = PyPDF2.PdfReader(file.file)
+            for page in reader.pages:
+                page_text = page.extract_text()
+                if page_text:
+                    text += page_text
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"PDF parsing error: {e}")
+
+    elif filename.endswith('.docx'):
+        if not DOCX_SUPPORT:
+            raise HTTPException(status_code=400, detail="DOCX support not available. Install python-docx.")
+        try:
+            doc = Document(file.file)
+            for para in doc.paragraphs:
+                if para.text:
+                    text += para.text + "\n"
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"DOCX parsing error: {e}")
+
+    else:
+        raise HTTPException(status_code=400, detail="Only TXT, PDF, DOCX files are allowed")
+
+    if not text.strip():
+        raise HTTPException(status_code=400, detail="No text found in file")
+
+    if len(text.strip()) < 10:
+        raise HTTPException(status_code=400, detail="text too short")
+
+    ref = ref_text.strip() if ref_text and ref_text.strip() else None
+    result = rez.full(text, ref)
+    if user:
+        _save_analysis(db, user, text, result)
+    return result
+
+
+def _resolve_export_result(req: ExportRequest) -> dict:
+    cached = req.result
+    if cached and isinstance(cached, dict) and cached.get("summary"):
+        return cached
+    return rez.full(req.text.strip(), req.ref_text)
+
+
+def _build_report_content(res: dict) -> str:
+    plag = res.get('plagiarism') or {}
+    return f"""OPUS REPORT
+================================
+
+TITLE: {res['title']}
+
+SUMMARY:
+{res['summary']}
+
+COMPRESSION: {res['compression']}%
+
+PLAN:
+{res['plan']}
+
+KEYWORDS:
+{', '.join([f"{k['word']} ({k['freq']})" for k in res['keywords']]) if res['keywords'] else 'none'}
+
+STATS:
+Chars: {res['stats']['chars']}
+Words: {res['stats']['words']}
+Sentences: {res['stats']['sentences']}
+Unique words: {res['stats']['unique']}
+Average word length: {res['stats']['avg_w_len']}
+Average sentence length: {res['stats']['avg_s_len']}
+
+ENTITIES:
+Persons: {', '.join([p['text'] for p in res['entities']['persons']]) if res['entities']['persons'] else 'none'}
+Organizations: {', '.join([o['text'] for o in res['entities']['orgs']]) if res['entities']['orgs'] else 'none'}
+Locations: {', '.join([l['text'] for l in res['entities']['locs']]) if res['entities']['locs'] else 'none'}
+Dates: {', '.join([d['text'] for d in res['entities']['dates']]) if res['entities']['dates'] else 'none'}
+
+PLAGIARISM:
+Uniqueness: {plag.get('uniqueness', 'n/a')}%
+Similarity: {plag.get('similarity', 'n/a')}
+Common words: {', '.join(plag.get('common', [])) if plag.get('common') else 'none'}
+
+Report generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+"""
 
 
 @app.post('/export/txt')
-async def export_txt(request: AnalyzeRequest):
-    result = rez.full_analysis(request.text)
-    
-    content = f"""OPUS TEXT ANALYSIS REPORT
-========================================
+async def export_txt(req: ExportRequest):
+    res = _resolve_export_result(req)
+    content = _build_report_content(res)
 
-TITLE:
-{result['title']}
-
-SUMMARY:
-{result['summary']}
-
-COMPRESSION:
-{result['compression']}%
-
-SENTIMENT:
-{result['sentiment']['sentiment']}
-Confidence: {result['sentiment']['confidence']:.1%}
-Positive words: {result['sentiment']['positive_words']}
-Negative words: {result['sentiment']['negative_words']}
-
-KEYWORDS:
-{', '.join([f"{kw['word']} ({kw['frequency']})" for kw in result['keywords']])}
-
-STATISTICS:
-Characters: {result['statistics']['total_characters']}
-Characters without spaces: {result['statistics']['characters_without_spaces']}
-Words: {result['statistics']['words']}
-Unique words: {result['statistics']['unique_words']}
-Sentences: {result['statistics']['sentences']}
-Average word length: {result['statistics']['average_word_length']}
-Average sentence length: {result['statistics']['average_sentence_length']}
-
-Analysis date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-"""
-    
-    filename = f"opus_analysis_{int(time.time())}.txt"
+    filename = os.path.join(EXPORT_DIR, f"opus_{int(time.time())}.txt")
     with open(filename, 'w', encoding='utf-8') as f:
         f.write(content)
-    
-    return FileResponse(filename, media_type='text/plain', filename=filename)
+
+    return FileResponse(filename, media_type='text/plain', filename=os.path.basename(filename))
 
 
 @app.post('/export/json')
-async def export_json(request: AnalyzeRequest):
-    result = rez.full_analysis(request.text)
-    
-    export_data = {
-        'title': result['title'],
-        'summary': result['summary'],
-        'compression': result['compression'],
-        'sentiment': result['sentiment'],
-        'keywords': result['keywords'],
-        'statistics': result['statistics'],
-        'exported_at': datetime.now().isoformat()
-    }
-    
-    filename = f"opus_analysis_{int(time.time())}.json"
+async def export_json(req: ExportRequest):
+    res = dict(_resolve_export_result(req))
+    res['exported'] = datetime.now().isoformat()
+
+    filename = os.path.join(EXPORT_DIR, f"opus_{int(time.time())}.json")
     with open(filename, 'w', encoding='utf-8') as f:
-        json.dump(export_data, f, ensure_ascii=False, indent=2)
-    
-    return FileResponse(filename, media_type='application/json', filename=filename)
+        json.dump(res, f, ensure_ascii=False, indent=2)
+
+    return FileResponse(filename, media_type='application/json', filename=os.path.basename(filename))
 
 
 @app.post('/export/pdf')
-async def export_pdf(request: AnalyzeRequest):
-    result = rez.full_analysis(request.text)
-    
+async def export_pdf(req: ExportRequest):
     try:
-        from reportlab.lib.pagesizes import A4
-        from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
-        from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-        from reportlab.lib.enums import TA_CENTER
+        import reportlab  # noqa: F401
     except ImportError:
-        raise HTTPException(status_code=500, detail="reportlab not installed. Run: pip install reportlab")
-    
-    filename = f"opus_analysis_{int(time.time())}.pdf"
-    doc = SimpleDocTemplate(filename, pagesize=A4)
-    styles = getSampleStyleSheet()
-    story = []
-    
-    title_style = ParagraphStyle('CustomTitle', parent=styles['Heading1'], alignment=TA_CENTER, spaceAfter=30)
-    story.append(Paragraph("OPUS TEXT ANALYSIS REPORT", title_style))
-    story.append(Spacer(1, 20))
-    
-    story.append(Paragraph(f"<b>Title:</b><br/>{result['title']}", styles['Normal']))
-    story.append(Spacer(1, 10))
-    story.append(Paragraph(f"<b>Summary:</b><br/>{result['summary']}", styles['Normal']))
-    story.append(Spacer(1, 10))
-    story.append(Paragraph(f"<b>Compression:</b> {result['compression']}%", styles['Normal']))
-    story.append(Spacer(1, 10))
-    story.append(Paragraph(f"<b>Sentiment:</b> {result['sentiment']['sentiment']}", styles['Normal']))
-    story.append(Spacer(1, 5))
-    
-    keywords_text = ", ".join([f"{kw['word']} ({kw['frequency']})" for kw in result['keywords']])
-    story.append(Paragraph(f"<b>Keywords:</b><br/>{keywords_text}", styles['Normal']))
-    story.append(Spacer(1, 10))
-    
-    story.append(Paragraph(f"<b>Statistics:</b><br/>", styles['Normal']))
-    story.append(Paragraph(f"Characters: {result['statistics']['total_characters']}", styles['Normal']))
-    story.append(Paragraph(f"Words: {result['statistics']['words']}", styles['Normal']))
-    story.append(Paragraph(f"Sentences: {result['statistics']['sentences']}", styles['Normal']))
-    
-    doc.build(story)
-    
-    return FileResponse(filename, media_type='application/pdf', filename=filename)
+        raise HTTPException(status_code=500, detail="ReportLab not installed. Run: pip install reportlab")
 
-
-@app.post('/register', response_model=UserResponse, status_code=status.HTTP_201_CREATED)
-async def register(user_data: UserRegister, db: Session = Depends(get_db)):
-    
-    if get_user_by_username(db, user_data.username):
-        raise HTTPException(status_code=400, detail="Имя пользователя уже занято")
-    
+    res = _resolve_export_result(req)
+    filename = os.path.join(EXPORT_DIR, f"opus_{int(time.time())}.pdf")
     try:
-        user = create_user(db, user_data.username, user_data.email, user_data.password)
-        logger.info(f"Зарегистрирован новый пользователь: {user.username}")
-        
+        build_pdf_report(res, filename)
+    except RuntimeError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    except Exception as e:
+        logger.error(f"PDF export error: {e}")
+        raise HTTPException(status_code=500, detail="PDF export failed")
+
+    return FileResponse(filename, media_type='application/pdf', filename=os.path.basename(filename))
+
+
+@app.post('/register', response_model=UserResponse, status_code=201)
+async def register(data: UserRegister, db: Session = Depends(get_db)):
+    if get_user_by_username(db, data.username):
+        raise HTTPException(status_code=400, detail="Username already taken")
+
+    if get_user_by_email(db, data.email):
+        raise HTTPException(status_code=400, detail="Email already registered")
+
+    try:
+        user = create_user(db, data.username, data.email, data.password)
+        logger.info(f"User registered: {user.username}")
         return UserResponse(
             id=user.id,
             username=user.username,
@@ -236,25 +323,22 @@ async def register(user_data: UserRegister, db: Session = Depends(get_db)):
             created_at=user.created_at.isoformat()
         )
     except Exception as e:
-        logger.error(f"Ошибка регистрации: {e}")
-        raise HTTPException(status_code=500, detail="Ошибка при создании пользователя")
+        logger.error(f"Registration error: {e}")
+        raise HTTPException(status_code=500, detail="Could not create user")
 
 
 @app.post("/login", response_model=TokenResponse)
-async def login(user_data: UserLogin, db: Session = Depends(get_db)):
-    
-    user = authenticate_user(db, user_data.username, user_data.password)
+async def login(data: UserLogin, db: Session = Depends(get_db)):
+    user = authenticate_user(db, data.username, data.password)
     if not user:
         raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Неверный логин или пароль",
+            status_code=401,
+            detail="Wrong username or password",
             headers={"WWW-Authenticate": "Bearer"},
         )
-    
-    token = create_access_token({"sub": user.username, "user_id": user.id})
-    
-    logger.info(f"Вход пользователя: {user.username}")
-    
+
+    token = create_access_token({"sub": user.username, "id": user.id})
+    logger.info(f"User logged in: {user.username}")
     return TokenResponse(
         access_token=token,
         token_type="bearer",
@@ -263,46 +347,8 @@ async def login(user_data: UserLogin, db: Session = Depends(get_db)):
     )
 
 
-def get_current_user(
-    credentials: HTTPAuthorizationCredentials = Depends(security),
-    db: Session = Depends(get_db)
-):
-    
-    token = credentials.credentials
-    
-    try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        username = payload.get("sub")
-        
-        if username is None:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Неверный токен",
-                headers={"WWW-Authenticate": "Bearer"},
-            )
-            
-    except JWTError as e:
-        logger.warning(f"Ошибка декодирования токена: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Неверный или просроченный токен",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-    
-    user = get_user_by_username(db, username)
-    if not user:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Пользователь не найден",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-    
-    return user
-
-
 @app.get("/profile", response_model=UserResponse)
 async def profile(current_user: User = Depends(get_current_user)):
-    
     return UserResponse(
         id=current_user.id,
         username=current_user.username,
@@ -311,14 +357,24 @@ async def profile(current_user: User = Depends(get_current_user)):
     )
 
 
+@app.get("/history", response_model=List[HistoryItem])
+async def get_history(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    return _history_items(db, current_user.id)
+
+
 @app.get("/stats")
-async def get_stats():
+async def get_stats(db: Session = Depends(get_db)):
+    total = db.query(Analysis).count()
     return {
-        "total_analyses": 0,
-        "models": {
-            "t5": rez.t5_model is not None,
-            "morph": rez.morph is not None
-        }
+        "total_analyses": total,
+        "model_loaded": rez.model is not None,
+        "morph_loaded": rez.morph is not None,
+        "ner_loaded": rez.ner_ok,
+        "pdf_support": PDF_SUPPORT,
+        "docx_support": DOCX_SUPPORT
     }
 
 

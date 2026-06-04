@@ -3,14 +3,39 @@ from transformers import T5ForConditionalGeneration, T5Tokenizer
 import warnings
 from nltk.corpus import stopwords
 from nltk.tokenize import word_tokenize, sent_tokenize
-from nltk.sentiment import SentimentIntensityAnalyzer
-from nltk.stem import WordNetLemmatizer
 import nltk
+import os
 from collections import Counter
 import json
 from datetime import datetime
+import re
+from natasha import (
+    Doc,
+    NewsEmbedding,
+    NewsNERTagger,
+    NewsMorphTagger,
+    NewsSyntaxParser,
+    Segmenter,
+)
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
 
+# Setup NLTK data path
+NLTK_DATA_PATH = os.path.join(os.path.dirname(__file__), 'nltk_data')
+os.makedirs(NLTK_DATA_PATH, exist_ok=True)
+nltk.data.path.append(NLTK_DATA_PATH)
 
+# Download required NLTK data
+for resource in ['punkt', 'stopwords', 'wordnet']:
+    try:
+        if resource == 'punkt':
+            nltk.data.find(f'tokenizers/{resource}')
+        else:
+            nltk.data.find(f'corpora/{resource}')
+    except LookupError:
+        nltk.download(resource, download_dir=NLTK_DATA_PATH, quiet=True)
+
+# Try to import pymorphy
 try:
     import pymorphy3
     MORPH_ANALYZER = pymorphy3.MorphAnalyzer
@@ -20,397 +45,381 @@ except ImportError:
         MORPH_ANALYZER = pymorphy2.MorphAnalyzer
     except ImportError:
         MORPH_ANALYZER = None
-
-
-nltk.download('punkt', quiet=True)
-nltk.download('stopwords', quiet=True)
-nltk.download('wordnet', quiet=True)
-nltk.download('vader_lexicon', quiet=True)
+        print("Warning: pymorphy2/pymorphy3 not installed")
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 
 
-class Rezumator:  
+class Rezumator:
     def __init__(self):
         self.dots = ['.', '!', '?']
-        self.sia = SentimentIntensityAnalyzer()
-        self.lemmatizer = WordNetLemmatizer()
-        self.russian_stopwords = set(stopwords.words('russian'))
-        self.t5_model = None
-        self.t5_tokenizer = None
+        self.stop_words = set(stopwords.words('russian'))
         
+        self.bad_words = set([
+            'просто', 'как', 'это', 'очень', 'так', 'вот', 'даже', 'ещё',
+            'уже', 'только', 'если', 'когда', 'потом', 'тут', 'там', 'вдруг',
+            'конечно', 'наверное', 'казалось', 'стало', 'стал', 'начала',
+            'начал', 'совсем', 'чуть', 'почти', 'прямо', 'сразу', 'наконец'
+        ])
+        self.title_stop_words = self.stop_words | {
+            'текст', 'система', 'документ', 'анализ', 'обработка', 'данные',
+            'работа', 'процесс', 'информация', 'материал', 'статья', 'раздел',
+            'часть', 'вид', 'тип', 'форма', 'способ', 'метод', 'результат',
+            'пример', 'случай', 'вопрос', 'ответ', 'задача', 'цель', 'средство',
+            'резюмирование', 'суммаризация', 'ключевое', 'слово', 'тема',
+            'основной', 'главный', 'общий', 'новый', 'старый', 'первый',
+            'второй', 'третий', 'много', 'мало', 'несколько', 'разный',
+        }
+        
+        self.model = None
+        self.tokenizer = None
+        
+        # Load T5 model (fixed from BART)
         try:
-            model_name = "IlyaGusev/rut5_base_sum_gazeta"
-            self.t5_tokenizer = T5Tokenizer.from_pretrained(model_name)
-            self.t5_model = T5ForConditionalGeneration.from_pretrained(model_name)
-            print("T5 модель загружена")
+            name = "IlyaGusev/rut5_base_sum_gazeta"
+            self.tokenizer = T5Tokenizer.from_pretrained(name)
+            self.model = T5ForConditionalGeneration.from_pretrained(name)
+            print("Model loaded successfully")
         except Exception as e:
-            print(f"Не удалось загрузить T5: {e}")
+            print(f"Model loading error: {e}")
+            self.model = None
+            self.tokenizer = None
 
+        # Initialize morphological analyzer
         if MORPH_ANALYZER:
             try:
                 self.morph = MORPH_ANALYZER()
-                print("Морфологический анализатор загружен")
+                print("Morphological analyzer loaded")
             except Exception as e:
-                print(f"Ошибка инициализации морфологического анализатора: {e}")
+                print(f"Morph error: {e}")
                 self.morph = None
         else:
-            print("Морфологический анализатор не установлен")
             self.morph = None
-
-    def normalize_word(self, word):
-        if not self.morph or not word or not isinstance(word, str):
-            return word
-            
+        
+        # Initialize NER pipeline
+        self.segmenter = None
+        self.morph_tagger = None
+        self.syntax_parser = None
+        self.ner_tagger = None
+        self.ner_ok = False
         try:
-            word_clean = word.strip('.,!?;:()[]{}"\'').lower()
-            if not word_clean:
-                return word
-                
-            parses = self.morph.parse(word_clean)
-            
-            if parses and len(parses) > 0:
-                parsed = parses[0]
-                return parsed.normal_form
+            emb = NewsEmbedding()
+            self.segmenter = Segmenter()
+            self.morph_tagger = NewsMorphTagger(emb)
+            self.syntax_parser = NewsSyntaxParser(emb)
+            self.ner_tagger = NewsNERTagger(emb)
+            self.ner_ok = True
+            print("NER loaded")
+        except Exception as e:
+            print(f"NER error: {e}")
+
+    def norm_word(self, w):
+        if not self.morph or not w or not isinstance(w, str):
+            return w
+        try:
+            w2 = w.strip('.,!?;:()[]{}"\'').lower()
+            if not w2:
+                return w
+            p = self.morph.parse(w2)
+            if p and len(p) > 0:
+                return p[0].normal_form
             else:
-                return word_clean
-                
+                return w2
         except Exception:
-            return word
+            return w
 
-    def normalize_text(self, text):
-        if not text or not self.morph:
-            return text
-            
+    def norm_text(self, t):
+        if not t or not self.morph:
+            return t
         try:
-            words = word_tokenize(text)
-            normalized_words = []
-            
-            for word in words:
-                normalized = self.normalize_word(word)
-                normalized_words.append(normalized)
-                
-            return ' '.join(normalized_words)
-            
+            words = word_tokenize(t)
+            res = []
+            for w in words:
+                res.append(self.norm_word(w))
+            return ' '.join(res)
         except Exception:
-            return text
+            return t
 
-    def get_statistics(self, text):
-        if not text:
+    def get_stats(self, t):
+        if not t:
             return {
-                'total_characters': 0,
-                'characters_without_spaces': 0,
+                'chars': 0,
+                'chars_no_space': 0,
                 'sentences': 0,
                 'words': 0,
-                'unique_words': 0,
-                'average_word_length': 0,
-                'average_sentence_length': 0
+                'unique': 0,
+                'avg_w_len': 0,
+                'avg_s_len': 0
             }
-        
-        normalized_text = self.normalize_text(text) if self.morph else text
-        text_without_spaces = text.replace(" ", "").replace("\n", "").replace("\t", "")
-        
-        sentences = 0
-        for char in text:
-            if char in self.dots:
-                sentences += 1
-        
-        words = word_tokenize(text)
-        unique_words = set(word_tokenize(normalized_text))
-        
+        no_space = t.replace(" ", "").replace("\n", "").replace("\t", "")
+        sents = 0
+        for c in t:
+            if c in self.dots:
+                sents += 1
+        words = word_tokenize(t)
+        uniq = set(word_tokenize(self.norm_text(t))) if self.morph else set(words)
         return {
-            'total_characters': len(text),
-            'characters_without_spaces': len(text_without_spaces),
-            'sentences': sentences,
+            'chars': len(t),
+            'chars_no_space': len(no_space),
+            'sentences': sents,
             'words': len(words),
-            'unique_words': len(unique_words),
-            'average_word_length': round(sum(len(word) for word in words) / len(words), 2) if words else 0,
-            'average_sentence_length': round(len(words) / sentences, 2) if sentences else 0
+            'unique': len(uniq),
+            'avg_w_len': round(sum(len(w) for w in words) / len(words), 2) if words else 0,
+            'avg_s_len': round(len(words) / sents, 2) if sents else 0
         }
 
-    def summarize(self, text, max_length=50, min_length=30):
-        if not text:
-            return "Текст не предоставлен"
-        
-        if not self.t5_model or not self.t5_tokenizer:
-            return "Ошибка: T5 модель не загружена"
-        
+    def get_comp(self, orig, summ):
+        if not orig or not summ:
+            return 0
+        ow = len(orig.split())
+        sw = len(summ.split())
+        if ow == 0:
+            return 0
+        return round((1 - sw / ow) * 100, 1)
+
+    def _extr(self, t):
+        s = sent_tokenize(t)
+        if len(s) <= 2:
+            return t
+        return ' '.join(s[:2])
+
+    def summ(self, t, max_len=60, min_len=15):
+        if not t or len(t.strip()) < 10:
+            return "text too short"
+        if not self.model or not self.tokenizer:
+            return self._extr(t)
         try:
-            text_preview = text[:512]
-            input_text = f"summarize: {text_preview}"
-            
-            inputs = self.t5_tokenizer(
-                input_text,
-                return_tensors="pt",
-                max_length=512,
-                truncation=True,
-                padding=True
-            )
-            
+            inp = self.tokenizer(t[:1000], return_tensors="pt", max_length=512, truncation=True, padding=True)
             with torch.no_grad():
-                outputs = self.t5_model.generate(
-                    inputs["input_ids"],
-                    max_length=max_length,
-                    min_length=min_length,
+                out = self.model.generate(
+                    inp["input_ids"],
+                    max_length=max_len,
+                    min_length=min_len,
                     num_beams=4,
                     early_stopping=True,
-                    no_repeat_ngram_size=2
+                    no_repeat_ngram_size=3,
+                    repetition_penalty=2.0
                 )
-            
-            summary = self.t5_tokenizer.decode(outputs[0], skip_special_tokens=True)
-            return summary.strip()
-            
+            res = self.tokenizer.decode(out[0], skip_special_tokens=True)
+            return res.strip() if res else self._extr(t)
         except Exception as e:
-            return f"Ошибка суммаризации: {str(e)}"
+            print(f"Summ error: {e}")
+            return self._extr(t)
 
-    def get_compression(self, original_text, summary):
-        if not original_text or not summary:
-            return 0
-        original_words = len(original_text.split())
-        summary_words = len(summary.split())
-        if original_words == 0:
-            return 0
-        return round((1 - summary_words / original_words) * 100, 1)
-
-    def analyze_sentiment(self, text):
-        if not text:
-            return {
-                'sentiment': 'НЕИЗВЕСТНО',
-                'score': 0,
-                'positive_words': 0,
-                'negative_words': 0,
-                'confidence': 0
-            }
-        
-        try:
-            if self.morph:
-                words = word_tokenize(text.lower())
-                normalized_words = [self.normalize_word(word) for word in words]
-                words_set = set(normalized_words)
-            else:
-                words_set = set(word_tokenize(text.lower()))
-            
-            positive_words = {   
-                'хорошо', 'отлично', 'прекрасно', 'замечательно', 'великолепно', 'идеально',
-                'безупречно', 'превосходно', 'блестяще', 'чудесно', 'восхитительно', 'успех',
-                'достижение', 'победа', 'триумф', 'результат', 'прогресс', 'развитие', 'рост',
-                'улучшение', 'прорыв', 'качественный', 'профессиональный', 'надежный', 'эффективный',
-                'удобный', 'полезный', 'функциональный', 'практичный', 'инновационный', 'рад',
-                'счастлив', 'восторг', 'удовольствие', 'ликование', 'восхищение', 'веселье',
-                'упоение', 'эйфория', 'блаженство', 'торжество', 'любовь', 'обожание', 'нежность',
-                'страсть', 'привязанность', 'симпатия', 'влюбленность', 'преданность', 'уважение',
-                'ласка', 'надежда', 'оптимизм', 'уверенность', 'вера', 'ожидание', 'перспектива',
-                'предвкушение', 'гордость', 'достоинство', 'самоуважение', 'честь', 'величие',
-                'достигнуть', 'рекомендую', 'советую', 'предлагаю', 'одобряю', 'поддерживаю',
-                'поощряю', 'приветствую', 'согласен', 'разделяю'
-            }
-            
-            negative_words = {
-                'плохо', 'тоска', 'ужасно', 'кошмарно', 'отвратительно', 'скверно', 'неудовлетворительно',
-                'неприемлемо', 'недопустимо', 'катастрофически', 'плачевно', 'проблема', 'ошибка',
-                'недочет', 'недоработка', 'дефект', 'брак', 'сбой', 'неполадка', 'трудность',
-                'препятствие', 'помеха', 'злой', 'раздраженный', 'яростный', 'негодующий',
-                'взбешенный', 'возмущенный', 'разъяренный', 'сердитый', 'недовольный', 'раздражение',
-                'ярость', 'грустный', 'печальный', 'тоскливый', 'унылый', 'скорбный', 'депрессивный',
-                'подавленный', 'несчастный', 'одинокий', 'безнадежный', 'отчаяние', 'боязнь',
-                'страх', 'опасение', 'тревога', 'паника', 'испуг', 'ужас', 'напряжение', 'нервозность',
-                'беспокойство', 'отвращение', 'омерзение', 'неприязнь', 'антипатия', 'ненависть',
-                'презрение', 'пренебрежение', 'брезгливость', 'критикую', 'осуждаю', 'обвиняю',
-                'жалуюсь', 'протестую', 'возражаю', 'не согласен', 'опровергаю', 'отрицаю',
-                'оспариваю', 'отказываюсь', 'отвергаю', 'отклоняю', 'запрещаю', 'не позволяю',
-                'не рекомендую', 'не советую', 'не одобряю', 'не поддерживаю'
-            }
-            
-            pos_count = len(words_set.intersection(positive_words))
-            neg_count = len(words_set.intersection(negative_words))
-            
-            total = pos_count + neg_count
-            if total > 0:
-                score = (pos_count - neg_count) / total
-            else:
-                score = 0
-            
-            if score > 0.1:
-                sentiment = "ПОЛОЖИТЕЛЬНЫЙ"
-            elif score < -0.1:
-                sentiment = "ОТРИЦАТЕЛЬНЫЙ"
-            else:
-                sentiment = "НЕЙТРАЛЬНЫЙ"
-            
-            return {
-                'sentiment': sentiment,
-                'score': round(score, 3),
-                'positive_words': pos_count,
-                'negative_words': neg_count,
-                'confidence': abs(round(score, 3))
-            }
-            
-        except Exception:
-            return {
-                'sentiment': 'НЕИЗВЕСТНО',
-                'score': 0,
-                'positive_words': 0,
-                'negative_words': 0,
-                'confidence': 0
-            }
-
-    def extract_keywords(self, text, top_n=10):
-        if not text:
+    def get_keywords(self, t, top=10):
+        if not t:
             return []
-        
         try:
-            words = word_tokenize(text.lower())
-            
-            filtered_words = []
-            for word in words:
-                if (word.isalnum() 
-                    and word not in self.russian_stopwords 
-                    and len(word) > 2):
-                    filtered_words.append(word)
-            
+            words = word_tokenize(t.lower())
+            good = []
+            for w in words:
+                if (w.isalnum() 
+                    and w not in self.stop_words 
+                    and w not in self.bad_words
+                    and len(w) > 2):
+                    good.append(w)
             if self.morph:
-                normalized_words = []
-                for word in filtered_words:
-                    normalized = self.normalize_word(word)
-                    normalized_words.append(normalized)
+                norm = []
+                for w in good:
+                    norm.append(self.norm_word(w))
             else:
-                normalized_words = filtered_words
-            
-            word_freq = Counter(normalized_words)
-            
-            keywords = []
-            total_words = len(normalized_words)
-            
-            for word, freq in word_freq.most_common(top_n):
-                score = freq / total_words if total_words > 0 else 0
-                    
-                keywords.append({
-                    'word': word,
-                    'frequency': freq,
-                    'score': round(score, 4)
-                })
-            
-            return keywords
-            
+                norm = good
+            freq = Counter(norm)
+            keys = []
+            total = len(norm)
+            for w, f in freq.most_common(top):
+                score = f / total if total > 0 else 0
+                keys.append({'word': w, 'freq': f, 'score': round(score, 4)})
+            return keys
         except Exception:
             return []
-
-    def generate_title(self, text):
-        if not text:
-            return "Анализ текста"
-            
-        if not self.t5_model:
-            keywords = self.extract_keywords(text, top_n=3)
-            if keywords and len(keywords) > 0:
-                main_words = [kw['word'] for kw in keywords[:2]]
-                return " ".join(main_words).capitalize()
-            return "Анализ текста"
-        
-        try:
-            text_preview = text[:200].strip()
-            input_text = f"заголовок: {text_preview}"
-            
-            inputs = self.t5_tokenizer(
-                input_text,
-                return_tensors="pt",
-                max_length=256,
-                truncation=True,
-                padding=True
-            )
-            
-            with torch.no_grad():
-                outputs = self.t5_model.generate(
-                    inputs["input_ids"],
-                    max_length=20,
-                    min_length=3,
-                    num_beams=4,
-                    temperature=0.8,
-                    top_p=0.9,
-                    do_sample=True,
-                    early_stopping=True,
-                    no_repeat_ngram_size=2
-                )
-            
-            title = self.t5_tokenizer.decode(outputs[0], skip_special_tokens=True)
-            title = title.strip()
-
-            prefixes = ["заголовок:", "Заголовок:", "Название:", "название:"]
-            for prefix in prefixes:
-                if title.lower().startswith(prefix.lower()):
-                    title = title[len(prefix):].strip()
-
-            title = title.replace('"', '').replace("'", "").replace('«', '').replace('»', '')
-
-            for char in ['.', ',', ';', ':', '-', '–', '—']:
-                if char in title:
-                    parts = title.split(char)
-                    if parts[0].strip():
-                        title = parts[0].strip()
-                        break
-            
-            title = ' '.join(title.split())
-            
-            if title and len(title) > 1:
-                title = title[0].upper() + title[1:]
-
-            words = title.split()
-            if len(words) > 8:
-                title = ' '.join(words[:8])
-                title = title.rstrip(' ,;:-')
-            
-            if not title or len(title) < 4 or len(words) < 2:
-                keywords = self.extract_keywords(text, top_n=3)
-                if keywords and len(keywords) > 0:
-                    main_words = [kw['word'] for kw in keywords[:2]]
-                    return " ".join(main_words).capitalize()
-                return "Программирование на Python"
-            
-            return title
     
-        except Exception as e:
-            print(f"Ошибка генерации заголовка: {e}")
-            keywords = self.extract_keywords(text, top_n=2)
-            if keywords and len(keywords) > 0:
-                main_words = [kw['word'] for kw in keywords[:2]]
-                return " ".join(main_words).capitalize()
-            return "Анализ текста"
+    def extract_urls(self, text):
+        pattern = r'https?://[^\s]+'
+        urls = re.findall(pattern, text)
+        return urls
 
-    def full_analysis(self, text):
-        if not text or len(text.strip()) < 10:
+    def make_plan(self, t, max_chars=1000):
+        if not t or not self.model:
+            return "Plan generation requires model"
+        txt = t[:max_chars]
+        try:
+            inp = self.tokenizer(f"plan: {txt}", return_tensors="pt", max_length=512, truncation=True, padding=True)
+            with torch.no_grad():
+                out = self.model.generate(
+                    inp["input_ids"],
+                    max_length=200,
+                    min_length=30,
+                    num_beams=4,
+                    early_stopping=True,
+                    no_repeat_ngram_size=3,
+                    repetition_penalty=1.5
+                )
+            plan = self.tokenizer.decode(out[0], skip_special_tokens=True)
+            return plan.strip() if plan else "Could not generate plan"
+        except Exception as e:
+            print(f"Plan error: {e}")
+            return "Could not generate plan"
+
+    def _capitalize_title(self, phrase: str) -> str:
+        parts = phrase.split()
+        return ' '.join(p[:1].upper() + p[1:] if p else '' for p in parts)
+
+    def _trim_sentence(self, sentence: str, max_len: int = 72) -> str:
+        s = sentence.strip()
+        if len(s) <= max_len:
+            return s
+        cut = s[:max_len].rsplit(' ', 1)[0]
+        return cut + '…'
+
+    def get_title(self, t, keywords=None, entities=None, summary=None):
+        if not t:
+            return "Без названия"
+
+        if entities is None:
+            entities = self.get_entities(t)
+        if keywords is None:
+            keywords = self.get_keywords(t, 12)
+
+        for key in ('persons', 'orgs', 'locs'):
+            group = entities.get(key) or []
+            if group:
+                return group[0]['text']
+
+        meaningful = []
+        for item in keywords:
+            word = item.get('word', '').strip()
+            if len(word) > 3 and word not in self.title_stop_words:
+                meaningful.append(word)
+        if meaningful:
+            if len(meaningful) >= 2:
+                return self._capitalize_title(f"{meaningful[0]} — {meaningful[1]}")
+            return self._capitalize_title(meaningful[0])
+
+        if summary and summary.strip():
+            headline = summary.strip().split('.')[0].strip()
+            if 12 <= len(headline) <= 90:
+                return self._capitalize_title(headline)
+
+        try:
+            sents = sent_tokenize(t.strip())
+            if sents:
+                return self._trim_sentence(sents[0])
+        except Exception:
+            pass
+
+        return "Анализ текста"
+
+    def get_entities(self, t):
+        if not self.ner_ok or not t:
+            return {'persons': [], 'orgs': [], 'locs': [], 'dates': []}
+        try:
+            doc = Doc(t[:5000])
+            doc.segment(self.segmenter)
+            doc.tag_morph(self.morph_tagger)
+            doc.parse_syntax(self.syntax_parser)
+            doc.tag_ner(self.ner_tagger)
+            persons = []
+            orgs = []
+            locs = []
+            dates = []
+            seen = set()
+            for span in doc.spans:
+                label = (span.type, span.text)
+                if label in seen:
+                    continue
+                seen.add(label)
+                if span.type == 'PER':
+                    persons.append({'text': span.text})
+                elif span.type == 'ORG':
+                    orgs.append({'text': span.text})
+                elif span.type == 'LOC':
+                    locs.append({'text': span.text})
+                elif span.type == 'DATE':
+                    dates.append({'text': span.text})
             return {
-                'error': 'Текст слишком короткий (минимум 10 символов)',
-                'statistics': self.get_statistics(text) if text else {},
-                'summary': 'Невозможно создать краткое содержание',
-                'sentiment': self.analyze_sentiment(text) if text else {},
-                'keywords': [],
-                'title': 'Анализ текста',
-                'compression': 0
+                'persons': persons,
+                'orgs': orgs,
+                'locs': locs,
+                'dates': dates
             }
+        except Exception as e:
+            print(f"NER error: {e}")
+            return {'persons': [], 'orgs': [], 'locs': [], 'dates': []}
+
+    def check_plag(self, student, ref):
+        if not student or not ref:
+            return {"uniqueness": 100, "similarity": 0, "common": []}
         
-        stats = self.get_statistics(text)
-        summary = self.summarize(text)
-        sentiment = self.analyze_sentiment(text)
-        keywords = self.extract_keywords(text, top_n=5)
-        title = self.generate_title(text)
-        compression = self.get_compression(text, summary)
+        sw = set(word_tokenize(student.lower()))
+        rw = set(word_tokenize(ref.lower()))
+        
+        sw = sw - self.stop_words
+        rw = rw - self.stop_words
+        
+        if not sw:
+            return {"uniqueness": 0, "similarity": 0, "common": []}
+        
+        common = sw & rw
+        uniq = round((1 - len(common) / len(sw)) * 100, 1)
+        
+        try:
+            vec = TfidfVectorizer(stop_words=list(self.stop_words))
+            tfidf = vec.fit_transform([student, ref])
+            sim = cosine_similarity(tfidf[0:1], tfidf[1:2])[0][0]
+        except:
+            sim = 0
         
         return {
-            'statistics': stats,
+            "uniqueness": uniq,
+            "similarity": round(sim, 3),
+            "common": list(common)[:10]
+        }
+
+    def full(self, t, ref=None):
+        if not t or len(t.strip()) < 10:
+            return {
+                'error': 'text too short',
+                'stats': self.get_stats(t) if t else {},
+                'summary': 'no summary',
+                'keywords': [],
+                'title': 'no title',
+                'plan': 'no plan',
+                'compression': 0,
+                'entities': {'persons': [], 'orgs': [], 'locs': [], 'dates': []},
+                'plagiarism': {}
+            }
+        
+        stats = self.get_stats(t)
+        summary = self.summ(t)
+        keywords = self.get_keywords(t, 5)
+        entities = self.get_entities(t)
+        title = self.get_title(t, keywords=keywords, entities=entities, summary=summary)
+        plan = self.make_plan(t)
+        comp = self.get_comp(t, summary)
+        
+        plag = {}
+        if ref:
+            plag = self.check_plag(t, ref)
+        
+        return {
+            'stats': stats,
             'summary': summary,
-            'sentiment': sentiment,
             'keywords': keywords,
             'title': title,
-            'compression': compression
+            'plan': plan,
+            'compression': comp,
+            'entities': entities,
+            'plagiarism': plag
         }
 
-    def save_to_json(self, text, filename="analysis_result.json"):
-        result = self.full_analysis(text)
-        result['timestamp'] = datetime.now().isoformat()
-        result['text_preview'] = text[:200] + ('...' if len(text) > 200 else '')
-        
+    def save_json(self, t, name="result.json"):
+        res = self.full(t)
+        res['time'] = datetime.now().isoformat()
+        res['preview'] = t[:200] + ('...' if len(t) > 200 else '')
         try:
-            with open(filename, 'w', encoding='utf-8') as f:
-                json.dump(result, f, ensure_ascii=False, indent=2)
-            return {"status": "success", "filename": filename}
+            with open(name, 'w', encoding='utf-8') as f:
+                json.dump(res, f, ensure_ascii=False, indent=2)
+            return {"status": "ok", "file": name}
         except Exception as e:
-            return {"status": "error", "message": str(e)}
+            return {"status": "error", "msg": str(e)}

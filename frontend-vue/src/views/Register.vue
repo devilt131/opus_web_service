@@ -1,60 +1,34 @@
 <template>
-  <div class="register">
-    <div class="card">
-      <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
-        <path d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" />
-        <path d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
-      </svg>
-      <h1>Регистрация</h1>
-      <div v-if="error" class="error">{{ error }}</div>
-      <form @submit.prevent="handleRegister">
-        <input type="text" v-model="username" placeholder="Логин" required />
-        <input type="email" v-model="email" placeholder="Email" required />
-        <input type="password" v-model="password" placeholder="Пароль" required />
-        <button :disabled="loading">{{ loading ? 'Регистрация...' : 'Зарегистрироваться' }}</button>
-      </form>
-      <p>Уже есть аккаунт? <router-link to="/login">Войти</router-link></p>
+  <div class="auth">
+    <div class="auth-card">
+      <h2>Register</h2>
+      <input v-model="username" type="text" placeholder="Username" />
+      <input v-model="email" type="email" placeholder="Email" />
+      <input v-model="password" type="password" placeholder="Password (min 6)" />
+      <button @click="register">Create account</button>
+      <p v-if="error" class="error">{{ error }}</p>
+      <p class="link"><router-link to="/login">Already have account?</router-link></p>
     </div>
   </div>
 </template>
 
 <script>
-import axios from 'axios'
+import api, { formatApiError } from '../api'
 
 export default {
-  data() {
-    return {
-      username: '',
-      email: '',
-      password: '',
-      loading: false,
-      error: ''
-    }
-  },
+  data() { return { username: '', email: '', password: '', error: '' } },
   methods: {
-    async handleRegister() {
-      this.loading = true
+    async register() {
       this.error = ''
-      
       try {
-        await axios.post('http://localhost:8000/register', {
+        await api.post('/register', {
           username: this.username,
           email: this.email,
           password: this.password
         })
         this.$router.push('/login')
       } catch (err) {
-        const detail = err.response?.data?.detail
-        
-        if (Array.isArray(detail)) {
-          this.error = detail.map(e => e.msg).join(', ')
-        } else if (typeof detail === 'string') {
-          this.error = detail
-        } else {
-          this.error = 'Ошибка регистрации'
-        }
-      } finally {
-        this.loading = false
+        this.error = formatApiError(err, 'Registration failed')
       }
     }
   }
@@ -62,83 +36,51 @@ export default {
 </script>
 
 <style scoped>
-.register {
+.auth {
   display: flex;
   justify-content: center;
   align-items: center;
   min-height: 70vh;
 }
-.card {
-  background: var(--surface-dark);
-  border: 1px solid var(--border-dark);
+.auth-card {
+  background: #111111;
+  border: 1px solid #1f1f1f;
   border-radius: 12px;
-  padding: 2rem;
-  width: 400px;
-  text-align: center;
+  padding: 32px;
+  width: 360px;
 }
-body.light .card {
-  background: var(--surface-light);
-  border: 1px solid var(--border-light);
-}
-.icon {
-  width: 48px;
-  height: 48px;
-  color: #1e6f9f;
-  margin-bottom: 1rem;
-}
-h1 {
-  font-weight: 300;
-  margin-bottom: 1.5rem;
-  color: var(--text-dark);
-}
-body.light h1 {
-  color: var(--text-light);
+h2 {
+  margin-bottom: 24px;
+  font-weight: 400;
 }
 input {
   width: 100%;
-  padding: 0.75rem;
-  margin-bottom: 1rem;
+  padding: 10px;
+  margin-bottom: 16px;
   background: #0a0a0a;
-  border: 1px solid var(--border-dark);
+  border: 1px solid #1f1f1f;
   border-radius: 6px;
-  color: var(--text-dark);
-}
-body.light input {
-  background: #ffffff;
-  border: 1px solid var(--border-light);
-  color: var(--text-light);
-}
-input:focus {
-  outline: none;
-  border-color: #1e6f9f;
+  color: #e5e5e5;
 }
 button {
   width: 100%;
-  padding: 0.75rem;
+  padding: 10px;
   background: #1e6f9f;
   color: white;
   border: none;
   border-radius: 6px;
   cursor: pointer;
 }
-button:disabled {
-  opacity: 0.5;
-}
 .error {
-  background: rgba(220, 38, 38, 0.2);
-  border: 1px solid #991b1b;
-  color: #fca5a5;
-  padding: 0.5rem;
-  border-radius: 6px;
-  margin-bottom: 1rem;
-  font-size: 0.875rem;
+  color: #f87171;
+  margin-top: 12px;
+  font-size: 13px;
 }
-p {
-  margin-top: 1rem;
-  color: #8b8b8b;
-  font-size: 0.875rem;
+.link {
+  margin-top: 16px;
+  text-align: center;
 }
-a {
+.link a {
   color: #1e6f9f;
   text-decoration: none;
 }
